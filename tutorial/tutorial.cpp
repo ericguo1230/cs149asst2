@@ -124,7 +124,7 @@ void condition_variable_example() {
     threads[0] = std::thread(signal_fn, thread_state);
     for (int i = 1; i < num_threads; i++) {
         threads[i] = std::thread(wait_fn, thread_state);
-    }
+    } 
     for (int i = 0; i < num_threads; i++) {
         threads[i].join();
     }
