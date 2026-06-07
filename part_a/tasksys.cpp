@@ -187,45 +187,43 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     this->next_task.store(0);
     this->completed_tasks.store(0);
     this->current_num_total_tasks.store(0);
+    this->shutdown.store(false);
 
     for (int i = 0; i < num_threads; i++) {
-        this->workers.push_back(std::thread([this]() {
-            while (!shutdown.load()){
-                int my_generation;
-                {
-                    std::unique_lock<std::mutex> lk(this->mutex);
-                    this->work_available.wait(lk, [this]() {
-                        return this->has_work || this->shutdown.load();
+        this->workers.push_back(std::thread([this, i]() {
+            while (!this->shutdown.load()){
+                std::unique_lock<std::mutex> lk(this->mutex);
+                this->work_available.wait(lk, [this]() {
+                    return this->has_work || this->shutdown.load();
+                });
+
+                if (this->shutdown.load()) {
+                    break;
+                }
+                
+                int worker_generation = this->generation;
+                if (this->next_task.load() >= this->current_num_total_tasks.load()) {
+                    this->work_available.wait(lk, [this, worker_generation]() {
+                        return this->shutdown.load() ||
+                               !this->has_work ||
+                               this->generation != worker_generation;
                     });
-                    if (this->shutdown.load()) {
-                        break;
-                    }
-                    my_generation = this->generation;
+                    continue;
                 }
 
-                while (!this->shutdown.load()) {
-                    int task_id = this->next_task.fetch_add(1);
-                    int num_total_tasks = this->current_num_total_tasks.load();
-                    if (task_id >= num_total_tasks) {
-                        std::unique_lock<std::mutex> lk(this->mutex);
-                        this->work_available.wait(lk, [this, my_generation]() {
-                            return this->generation != my_generation || this->shutdown.load();
-                        });
-                        break;
-                    }
+                IRunnable* runnable = this->current_runnable;
+                int num_total_tasks = this->current_num_total_tasks.load();
+                int task_id = this->next_task.fetch_add(1);
+                lk.unlock();
 
-                    IRunnable* runnable = this->current_runnable;
-                    runnable->runTask(task_id, num_total_tasks);
-                    int completed = this->completed_tasks.fetch_add(1) + 1;
-                    if (completed == num_total_tasks){
-                        {
-                            std::unique_lock<std::mutex> lk(this->mutex);
-                            if (this->generation == my_generation) {
-                                has_work = false;
-                            }
-                        }
-                        this->work_done.notify_all();
+                runnable->runTask(task_id, num_total_tasks);
+                int completed = this->completed_tasks.fetch_add(1) + 1;
+                if (completed == num_total_tasks){
+                    {
+                        std::unique_lock<std::mutex> lk(this->mutex);
+                        this->has_work = false;
                     }
+                    this->work_done.notify_all();
                 }
             }
         }));
@@ -234,7 +232,9 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     this->shutdown.store(true);
+
     this->work_available.notify_all();
+
     for (auto& worker : this->workers) {
         if (worker.joinable()) {
             worker.join();
@@ -247,15 +247,14 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     if (num_total_tasks <= 0) {
         return;
     }
-
     this->current_num_total_tasks.store(num_total_tasks);
     this->next_task.store(0);
     this->completed_tasks.store(0);
     {
         std::unique_lock<std::mutex> lk(this->mutex);
         this->current_runnable = runnable;
-        this->generation++;
         this->has_work = true;
+        this->generation++;
     }
     this->work_available.notify_all();
     std::unique_lock<std::mutex> lk(this->mutex);
