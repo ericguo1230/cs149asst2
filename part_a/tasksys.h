@@ -2,6 +2,9 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 /*
@@ -55,8 +58,14 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
                                 const std::vector<TaskID>& deps);
         void sync();
     private:
-        int num_threads;
-};
+        std::vector<std::thread> workers;
+        std::atomic<bool> shutdown{false};
+        std::atomic<bool> has_work{false};
+        std::atomic<int> next_task{0};
+        std::atomic<int> completed_tasks{0};
+        IRunnable* current_runnable = nullptr;
+        std::atomic<int> current_num_total_tasks{0};
+    };
 
 /*
  * TaskSystemParallelThreadPoolSleeping: This class is the student's
@@ -74,7 +83,17 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
                                 const std::vector<TaskID>& deps);
         void sync();
     private:
-        int num_threads;
+        std::vector<std::thread> workers;
+        std::mutex mutex;
+        std::condition_variable work_available;
+        std::condition_variable work_done;
+        std::atomic<bool> shutdown{false};
+        bool has_work = false;
+        int generation = 0;
+        IRunnable* current_runnable = nullptr;
+        std::atomic<int> current_num_total_tasks{0};
+        std::atomic<int> next_task{0};
+        std::atomic<int> completed_tasks{0};
 };
 
 #endif

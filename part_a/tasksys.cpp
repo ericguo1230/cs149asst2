@@ -104,51 +104,58 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
     return "Parallel + Thread Pool + Spin";
 }
 
-class TaskCounter{
-    public:
-        int taskID;
-        std::mutex* g_taskID_mutex;
-        TaskCounter() {
-            this->taskID = -1;
-            this->g_taskID_mutex = new std::mutex();
-        }
-        ~TaskCounter() {
-            delete this->g_taskID_mutex;
-        }
-        int get_task();
-};
-
-int TaskCounter::get_task(){
-    std::lock_guard<std::mutex> lock(*this->g_taskID_mutex); 
-    this->taskID++;
-    return this->taskID;
-} 
-
 TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int num_threads): ITaskSystem(num_threads) {
-    this->num_threads = num_threads;
-}
+    this->current_runnable = nullptr;
+    this->workers.reserve(num_threads);
 
-TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
-}
-
-void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
-    TaskCounter* taskCounter = new TaskCounter();
-    std::vector<std::thread> threads;
-
-    for (int i = 0; i < this->num_threads; i++) {
-        threads.push_back(std::thread([runnable, num_total_tasks, taskCounter]() {
-            while (true) {
-                int current_taskID = taskCounter->get_task();
-                if (current_taskID >= num_total_tasks) {
-                    break;
+    for (int i = 0; i < num_threads; i++) {
+        this->workers.push_back(std::thread([this]() {
+            while (!this->shutdown.load()) {
+                if (!this->has_work.load()) {
+                    std::this_thread::yield();
+                    continue;
                 }
-                runnable->runTask(current_taskID, num_total_tasks);
+
+                int task_id = this->next_task.fetch_add(1);
+                int num_total_tasks = this->current_num_total_tasks.load();
+                if (task_id >= num_total_tasks) {
+                    std::this_thread::yield();
+                    continue;
+                }
+
+                this->current_runnable->runTask(task_id, num_total_tasks);
+                int completed = this->completed_tasks.fetch_add(1) + 1;
+                if (completed == num_total_tasks) {
+                    this->has_work.store(false);
+                }
             }
         }));
     }
+}
 
-    for (auto& t : threads) {
-        t.join();
+TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
+    shutdown.store(true);
+
+    for (auto& worker : this->workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
+    if (num_total_tasks <= 0) {
+        return;
+    }
+
+    this->current_runnable = runnable;
+    this->current_num_total_tasks.store(num_total_tasks);
+    this->next_task.store(0);
+    this->completed_tasks.store(0);
+    this->has_work.store(true);
+
+    while (this->has_work.load()) {
+        std::this_thread::yield();
     }
 }
 
@@ -173,104 +180,88 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
     return "Parallel + Thread Pool + Sleep";
 }
 
-//Pseudo code
-//1. We use producer-consumer model for thread pool
-//2. Use taskID to keep track of next task to execute
-//3. Threads execute first task then sleep until they are notified
-//4. Once a thread finishes it wakes up main thread to check if there are more tasks to execute, if so it wakes up one sleeping thread to execute the next task
-
-class ConsumerProducerCV{
-    public:
-        int taskID;
-        int completedTasks;
-        std::mutex* taskID_mutex_;
-        std::mutex* completed_tasks;
-        std::condition_variable* prod_cv;
-        std::condition_variable* work_done_cv;
-        int num_waiting_threads_;
-        ConsumerProducerCV(int num_waiting_threads) {
-            taskID = -1;
-            completedTasks = 0;
-            taskID_mutex_ = new std::mutex();
-            prod_cv = new std::condition_variable();
-            work_done_cv = new std::condition_variable();
-            num_waiting_threads_ = num_waiting_threads;
-            completed_tasks = new std::mutex();
-        }
-        ~ConsumerProducerCV() {
-            delete taskID_mutex_;
-            delete prod_cv;
-            delete work_done_cv;
-            delete completed_tasks;
-        }
-};
-
-void signal_fn(ConsumerProducerCV* thread) {
-    thread->taskID_mutex_->lock();
-    while (thread->num_waiting_threads_ > 0) {
-        thread->taskID_mutex_->unlock();
-        thread->prod_cv->notify_all();
-        thread->taskID_mutex_->lock();
-    }
-    thread->taskID_mutex_->unlock();
-}
-
-void wait_fn(ConsumerProducerCV* thread) {
-    std::unique_lock<std::mutex> lk(*thread->taskID_mutex_);
-    thread->prod_cv->wait(lk);
-    thread->num_waiting_threads_--;
-    lk.unlock();
-}
-
-
 TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads) {
-    this->num_threads = num_threads;
+    this->current_runnable = nullptr;
+    this->workers.reserve(num_threads);
+    this->has_work = false;
+    this->next_task.store(0);
+    this->completed_tasks.store(0);
+    this->current_num_total_tasks.store(0);
+
+    for (int i = 0; i < num_threads; i++) {
+        this->workers.push_back(std::thread([this]() {
+            while (!shutdown.load()){
+                int my_generation;
+                {
+                    std::unique_lock<std::mutex> lk(this->mutex);
+                    this->work_available.wait(lk, [this]() {
+                        return this->has_work || this->shutdown.load();
+                    });
+                    if (this->shutdown.load()) {
+                        break;
+                    }
+                    my_generation = this->generation;
+                }
+
+                while (!this->shutdown.load()) {
+                    int task_id = this->next_task.fetch_add(1);
+                    int num_total_tasks = this->current_num_total_tasks.load();
+                    if (task_id >= num_total_tasks) {
+                        std::unique_lock<std::mutex> lk(this->mutex);
+                        this->work_available.wait(lk, [this, my_generation]() {
+                            return this->generation != my_generation || this->shutdown.load();
+                        });
+                        break;
+                    }
+
+                    IRunnable* runnable = this->current_runnable;
+                    runnable->runTask(task_id, num_total_tasks);
+                    int completed = this->completed_tasks.fetch_add(1) + 1;
+                    if (completed == num_total_tasks){
+                        {
+                            std::unique_lock<std::mutex> lk(this->mutex);
+                            if (this->generation == my_generation) {
+                                has_work = false;
+                            }
+                        }
+                        this->work_done.notify_all();
+                    }
+                }
+            }
+        }));
+    }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
+    this->shutdown.store(true);
+    this->work_available.notify_all();
+    for (auto& worker : this->workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
 }
 
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-    std::thread* threads = new std::thread[this->num_threads];
-    ConsumerProducerCV* thread = new ConsumerProducerCV(this->num_threads);
-
-    // Create all worker threads
-    for (int i = 0; i < this->num_threads; i++) {
-        threads[i] = std::thread([thread, num_total_tasks, runnable]() { 
-            wait_fn(thread); 
-            thread->taskID_mutex_->lock();
-            int completed_tasks = 0;
-            while (thread->taskID < num_total_tasks - 1) {
-                thread->taskID++;
-                int current_taskID = thread->taskID;
-                thread->taskID_mutex_->unlock();
-                runnable->runTask(current_taskID, num_total_tasks);
-                completed_tasks++;
-                thread->taskID_mutex_->lock();
-            }
-            thread->taskID_mutex_->unlock();
-            thread->completed_tasks->lock();
-            thread->completedTasks += completed_tasks;
-            if (thread->completedTasks >= num_total_tasks) {
-                thread->work_done_cv->notify_all();
-            }
-            thread->completed_tasks->unlock();
-        });
+    if (num_total_tasks <= 0) {
+        return;
     }
 
-    signal_fn(thread);
-    std::unique_lock<std::mutex> lk(*thread->completed_tasks);
-    thread->work_done_cv->wait(lk);
-    //Maybe verify all work is done?
-    lk.unlock();
-
-    for (int i = 0; i < this->num_threads; i++) {
-        threads[i].join();
+    this->current_num_total_tasks.store(num_total_tasks);
+    this->next_task.store(0);
+    this->completed_tasks.store(0);
+    {
+        std::unique_lock<std::mutex> lk(this->mutex);
+        this->current_runnable = runnable;
+        this->generation++;
+        this->has_work = true;
     }
-
-    delete thread;
-    delete[] threads;
+    this->work_available.notify_all();
+    std::unique_lock<std::mutex> lk(this->mutex);
+    this->work_done.wait(lk, [this]() {
+        return !this->has_work;
+    });
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
