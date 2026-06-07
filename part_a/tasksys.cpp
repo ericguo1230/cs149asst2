@@ -267,18 +267,14 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
                                                     const std::vector<TaskID>& deps) {
 
 
-    //
-    // TODO: CS149 students will implement this method in Part B.
-    //
-
+    //launch tasks
+    //maybe use a condition variable to signal when dependencies are done?            
     return 0;
 }
 
 void TaskSystemParallelThreadPoolSleeping::sync() {
 
-    //
-    // TODO: CS149 students will modify the implementation of this method in Part B.
-    //
+    //wait for tasks to finish
 
     return;
 }

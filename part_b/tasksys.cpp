@@ -1,4 +1,11 @@
 #include "tasksys.h"
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <queue>
+#include <unordered_set>
+#include <map>
 
 
 IRunnable::~IRunnable() {}
@@ -126,22 +133,126 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
     return "Parallel + Thread Pool + Sleep";
 }
 
+void TaskSystemParallelThreadPoolSleeping::addTaskToWorkQueue(TaskDetail* task) {
+    std::lock_guard<std::mutex> lock(this->queue_mutex);
+    this->task_queue.push(task);
+}
+
+//PRECONDITION: LOCK HAS BEEN OBTAINED
+void TaskSystemParallelThreadPoolSleeping::insertDependent(TaskID task_id, TaskDetail* task) {
+    this->task_dependents[task_id].push_back(task);
+}
+
+
+void TaskSystemParallelThreadPoolSleeping::updateDependents(TaskID finished_task) {
+    std::lock_guard<std::mutex> lk(this->dependents_mutex);
+
+    auto it = this->task_dependents.find(finished_task);
+    if (it == this->task_dependents.end()) {
+        return;
+    }
+
+    for (TaskDetail* dependent : it->second) {
+        std::lock_guard<std::mutex> lock(dependent->mutex);
+        dependent->remaining_dependencies -= 1;
+
+        if (dependent->remaining_dependencies == 0) {
+            addTaskToWorkQueue(dependent);
+            this->task_available.notify_all();
+        }
+    }
+
+    this->task_dependents.erase(it);
+}
+
 TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    this->threads.reserve(num_threads);
+    std::mutex queue_mutex; 
+    std::mutex completed_tasks_mutex;
+    std::mutex dependents_mutex;
+
+    for (int i = 0; i < num_threads; i++) {
+        this->threads.emplace_back([this]() {
+            while (true) {
+                TaskDetail* task = nullptr;
+                int task_id = -1;
+                int num_total_tasks = -1;
+                bool completed_whole_task = false;
+
+                {
+                    std::unique_lock<std::mutex> lk(this->queue_mutex);
+
+                    this->task_available.wait(lk, [&] {
+                        return this->shutdown.load() || !this->task_queue.empty();
+                    });
+
+                    if (this->shutdown.load()) {
+                        return;
+                    }
+
+                    task = this->task_queue.front();
+
+                    task->remaining_tasks--;
+
+                    task_id = task->num_total_tasks - task->remaining_tasks - 1;
+                    num_total_tasks = task->num_total_tasks;
+
+                    if (task->remaining_tasks == 0) {
+                        this->task_queue.pop();
+                    }
+                } // release queue_mutex before running task
+
+                task->runnable->runTask(task_id, num_total_tasks);
+                
+                {
+                    std::lock_guard<std::mutex> lock(task->mutex);
+                    task->tasks_done++;
+                    completed_whole_task = (task->tasks_done == task->num_total_tasks);
+                }
+
+                if (completed_whole_task) {
+                    {
+                        std::lock_guard<std::mutex> lk(this->completed_tasks_mutex);
+                        this->completed_tasks.insert(task->id);
+                    }
+
+                    this->updateDependents(task->id);
+                    this->incomplete_tasks--;
+                    this->task_done.notify_all();
+                }
+            }
+        });
+    }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
-    //
-    // TODO: CS149 student implementations may decide to perform cleanup
-    // operations (such as thread pool shutdown construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    this->shutdown.store(true);
+    this->task_available.notify_all();
+    
+    for (auto& thread : this->threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    
+    // Clean up remaining TaskDetail objects in task_queue
+    while (!this->task_queue.empty()) {
+        delete this->task_queue.front();
+        this->task_queue.pop();
+    }
+    
+    // Clean up remaining TaskDetail objects in waiting_tasks
+    while (!this->waiting_tasks.empty()) {
+        delete this->waiting_tasks.front();
+        this->waiting_tasks.pop();
+    }
+    
+    // Clean up remaining TaskDetail objects in task_dependents
+    for (auto& entry : this->task_dependents) {
+        for (TaskDetail* task : entry.second) {
+            delete task;
+        }
+    }
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
@@ -160,24 +271,42 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                                     const std::vector<TaskID>& deps) {
-
-
-    //
-    // TODO: CS149 students will implement this method in Part B.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+    TaskID task_id = this->next_task_id.fetch_add(1);
+    TaskDetail* task = new TaskDetail(runnable, num_total_tasks, deps, task_id);
+    this->incomplete_tasks++;
+    if (deps.empty()) {
+        //No dependencies, add to work queue
+        addTaskToWorkQueue(task);
+        this->task_available.notify_all();
+        return task_id;
     }
-
-    return 0;
+    {
+        std::lock_guard<std::mutex> lock(this->completed_tasks_mutex);
+        std::lock_guard<std::mutex> lock_dependent(this->dependents_mutex);
+        std::lock_guard<std::mutex> lock_queue(this->queue_mutex);
+        for (const auto& dep : deps) {
+            if (this->completed_tasks.count(dep)) {
+                task->remaining_dependencies--;
+            } else{
+                insertDependent(dep, task);
+            }
+        }
+    }
+    if (task->remaining_dependencies == 0) {
+        addTaskToWorkQueue(task);
+        this->task_available.notify_all();
+    } else {
+        std::lock_guard<std::mutex> lock(this->queue_mutex);
+        this->waiting_tasks.push(task);
+    }
+    return task_id;
 }
 
 void TaskSystemParallelThreadPoolSleeping::sync() {
-
-    //
-    // TODO: CS149 students will modify the implementation of this method in Part B.
-    //
-
+    //Precondition: this assumes we will eventually have all the dependencies to run a task
+    std::unique_lock<std::mutex> lk(this->queue_mutex);
+    this->task_done.wait(lk, [&] {
+        return this->shutdown.load() || this->incomplete_tasks.load() == 0;
+    });
     return;
 }

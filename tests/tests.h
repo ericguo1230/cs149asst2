@@ -61,10 +61,29 @@ typedef struct {
  * Implement your task here
 */
 class YourTask : public IRunnable {
+    private:
+        int* output_;
+        int launch_id_;
+        int delay_ms_;
+
     public:
-        YourTask() {}
+        YourTask(int* output, int launch_id, int delay_ms)
+            : output_(output), launch_id_(launch_id), delay_ms_(delay_ms) {}
         ~YourTask() {}
-        void runTask(int task_id, int num_total_tasks) {}
+
+        void runTask(int task_id, int num_total_tasks) {
+            if (delay_ms_ > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_));
+            }
+
+            if (task_id == 0) {
+                if (launch_id_ == 0 || output_[launch_id_ - 1] == 1) {
+                    output_[launch_id_] = 1;
+                } else {
+                    output_[launch_id_] = -1;
+                }
+            }
+        }
 };
 /*
  * Implement your test here. Call this function from a wrapper that passes in
@@ -72,20 +91,36 @@ class YourTask : public IRunnable {
  * `simpleTestAsync` as an example.
  */
 TestResults yourTest(ITaskSystem* t, bool do_async, int num_elements, int num_bulk_task_launches) {
-    // TODO: initialize your input and output buffers
-    int* output = new int[num_elements];
+    int output_size = num_elements;
+    if (num_bulk_task_launches > output_size) {
+        output_size = num_bulk_task_launches;
+    }
 
-    // TODO: instantiate your bulk task launches
+    int* output = new int[output_size];
+    for (int i=0; i<output_size; i++) {
+        output[i] = 0;
+    }
+
+    YourTask** tasks = new YourTask*[num_bulk_task_launches];
+    for (int i=0; i<num_bulk_task_launches; i++) {
+        int delay_ms = (i == 0) ? 50 : 1;
+        tasks[i] = new YourTask(output, i, delay_ms);
+    }
 
     // Run the test
     double start_time = CycleTimer::currentSeconds();
     if (do_async) {
-        // TODO:
-        // initialize dependency vector
-        // make calls to t->runAsyncWithDeps and push TaskID to dependency vector
-        // t->sync() at end
+        std::vector<TaskID> deps;
+        for (int i=0; i<num_bulk_task_launches; i++) {
+            TaskID task_id = t->runAsyncWithDeps(tasks[i], 1, deps);
+            deps.clear();
+            deps.push_back(task_id);
+        }
+        t->sync();
     } else {
-        // TODO: make calls to t->run
+        for (int i=0; i<num_bulk_task_launches; i++) {
+            t->run(tasks[i], 1);
+        }
     }
     double end_time = CycleTimer::currentSeconds();
 
@@ -93,13 +128,8 @@ TestResults yourTest(ITaskSystem* t, bool do_async, int num_elements, int num_bu
     TestResults results;
     results.passed = true;
 
-    for (int i=0; i<num_elements; i++) {
-        int value = 0; // TODO: initialize value
-        for (int j=0; j<num_bulk_task_launches; j++) {
-            // TODO: update value as expected
-        }
-
-        int expected = value;
+    for (int i=0; i<num_bulk_task_launches; i++) {
+        int expected = 1;
         if (output[i] != expected) {
             results.passed = false;
             printf("%d: %d expected=%d\n", i, output[i], expected);
@@ -108,6 +138,10 @@ TestResults yourTest(ITaskSystem* t, bool do_async, int num_elements, int num_bu
     }
     results.time = end_time - start_time;
 
+    for (int i=0; i<num_bulk_task_launches; i++) {
+        delete tasks[i];
+    }
+    delete [] tasks;
     delete [] output;
 
     return results;
